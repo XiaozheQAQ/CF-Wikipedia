@@ -1,4 +1,4 @@
-# zh-wiki-mirror
+# CF-Wikipedia
 
 用 Cloudflare Workers 搭建的中文维基百科镜像，面向无法直连维基的用户。单文件部署，免服务器，免费额度够日常用。
 
