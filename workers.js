@@ -44,6 +44,7 @@ const WIKI = 'zh.wikipedia.org';   // 唯一上游
 
 const PROXY_HOSTS = [
   'upload.wikimedia.org',
+  'thumb.wikimedia.org',
   'upload.wikipedia.org',
   'bits.wikimedia.org',
   'meta.wikimedia.org',
