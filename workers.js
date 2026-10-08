@@ -134,14 +134,18 @@ async function handle(event) {
       /^\/wiki\/Special:(UserLogin|CreateAccount|Watchlist|Preferences|Contributions)/.test(url.pathname))
     return plain('Read-only mirror.', 403);
 
-  const { type, upURL } = classify(url);
+  const route = classify(url);
+  if (route.type === 'blocked')
+    return plain('Unsupported media host.', 403);
+  const { type, upURL } = route;
 
   // Cache API（Range 请求与媒体不走应用层缓存）
   const cache   = caches.default;
-  const ckey    = makeCacheKey(type, url, mobile);
+  const cacheable = isCacheableRequest(req, type);
+  const ckey    = makeCacheKey(type, url, mobile, req);
   const isRange = req.headers.has('range');
 
-  if (!isRange && type !== 'media') {
+  if (cacheable && !isRange && type !== 'media') {
     const hit = await cache.match(ckey);
     if (hit) {
       const h = new Headers(hit.headers);
@@ -163,10 +167,13 @@ async function handle(event) {
     // ★ Bug-3 修复：严格验证 Content-Type，HTML 错误页不当 CSS 处理
     res = await buildCSS(upRes, myHost);
   } else {
-    res = pass(upRes, type);
+    res = pass(upRes, type, myHost);
   }
 
-  if (st === 200 && !isRange && type !== 'media')
+  if (isPrivateRequest(req))
+    res.headers.set('cache-control', 'private, no-store');
+
+  if (st === 200 && cacheable && !isRange && type !== 'media')
     event.waitUntil(cache.put(ckey, res.clone()));
 
   return res;
@@ -185,6 +192,8 @@ function classify(url) {
     const slash = rest.indexOf('/');
     const host  = slash === -1 ? rest : rest.slice(0, slash);
     const fp    = slash === -1 ? '/' : rest.slice(slash);
+    if (!isAllowedProxyHost(host))
+      return { type: 'blocked', upURL: '' };
     return { type: 'media', upURL: mkURL('https', host, fp, s) };
   }
 
@@ -265,25 +274,25 @@ async function fetchUpstream(upURL, req, type, mobile) {
       cacheEverything: type !== 'html' && type !== 'api',
       cacheTtl:        TTL[type] ?? TTL.html,
       // ★ HTML 移动/桌面 cf 缓存 key 分离（cookie 不同，内容不同）
-      cacheKey: upURL + (mobile && type === 'html' ? '#m' : ''),
+      cacheKey: makeUpstreamCacheKey(upURL, req, type, mobile),
     },
   };
 
+  const ctrl  = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
   try {
-    const ctrl  = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
-    const r     = await fetch(upURL, { ...opts, signal: ctrl.signal });
-    clearTimeout(timer);
-    return r;
+    return await fetch(upURL, { ...opts, signal: ctrl.signal });
   } catch (_) {
-    try { return await fetch(upURL, opts); } catch (__) { return null; }
+    return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
 // ── HTML 流式改写 ──────────────────────────────────────────────────────────
 
 function buildHTML(res, myHost, reqUrl, mobile) {
-  const headers = buildHeaders(res.headers, 'html');
+  const headers = buildHeaders(res.headers, 'html', myHost);
 
   const fn   = clientScript.toString();
   const body = fn.slice(fn.indexOf('{') + 1, fn.lastIndexOf('}'));
@@ -391,7 +400,7 @@ function buildHTML(res, myHost, reqUrl, mobile) {
 async function buildCSS(res, myHost) {
   const text    = await res.text();
   const fixed   = rewriteCSS(text, myHost);
-  const headers = buildHeaders(res.headers, 'css');
+  const headers = buildHeaders(res.headers, 'css', myHost);
   headers.set('content-type', 'text/css; charset=UTF-8');
   headers.delete('content-encoding'); // fetch 已解压，删除防止长度不匹配
   return new Response(fixed, { status: res.status, headers });
@@ -794,7 +803,7 @@ function clientScript() {
 
 // ── 响应头 ────────────────────────────────────────────────────────────────
 
-function buildHeaders(upH, type) {
+function buildHeaders(upH, type, myHost = '') {
   const h = new Headers(upH);
   h.set('access-control-allow-origin',   '*');
   h.set('access-control-allow-methods',  'GET, HEAD, OPTIONS');
@@ -804,7 +813,13 @@ function buildHeaders(upH, type) {
   h.delete('content-security-policy-report-only');
   h.delete('clear-site-data');
   h.delete('x-frame-options');
+  h.delete('set-cookie');
+  h.delete('content-location');
   h.delete('content-length');
+  if (h.has('location')) {
+    if (myHost) h.set('location', rewriteURL(h.get('location'), myHost));
+    else h.delete('location');
+  }
 
   const ttl = TTL[type] ?? TTL.html;
   switch (type) {
@@ -827,7 +842,7 @@ function buildHeaders(upH, type) {
       h.set('cache-control', 'public, max-age=' + ttl);
   }
 
-  h.set('vary',                   'Accept-Encoding');
+  h.set('vary',                   'Accept-Encoding, Accept-Language');
   h.set('x-content-type-options', 'nosniff');
   h.set('x-cache',                'MISS');
   h.set('timing-allow-origin',    '*');
@@ -837,22 +852,51 @@ function buildHeaders(upH, type) {
   return h;
 }
 
-function pass(res, type) {
-  return new Response(res.body, { status: res.status, headers: buildHeaders(res.headers, type) });
+function pass(res, type, myHost) {
+  return new Response(res.body, {
+    status: res.status,
+    headers: buildHeaders(res.headers, type, myHost),
+  });
 }
 
 // ── 工具函数 ──────────────────────────────────────────────────────────────
 
 // ★ Bug-2 修复：正确拼接移动端 cache key，不产生双 ?
-function makeCacheKey(type, url, mobile) {
-  // 仅 HTML 类型需要区分移动/桌面（CSS/JS/图片内容相同）
-  const mobileSuffix = (mobile && type === 'html')
-    ? (url.search ? '&__m=1' : '?__m=1')
+function isCacheableRequest(req, type) {
+  if (type === 'media' || req.method !== 'GET') return false;
+  return !isPrivateRequest(req);
+}
+
+function isPrivateRequest(req) {
+  return req.method !== 'GET' ||
+    req.headers.has('authorization') ||
+    req.headers.has('cookie');
+}
+
+function languageVariant(req) {
+  return (req.headers.get('accept-language') || 'zh-CN,zh;q=0.9,en;q=0.8')
+    .trim()
+    .slice(0, 256);
+}
+
+function makeUpstreamCacheKey(upURL, req, type, mobile) {
+  const variant = type === 'html' || type === 'api'
+    ? '&__lang=' + encodeURIComponent(languageVariant(req))
     : '';
-  return new Request(
-    'https://x.cache/' + type + url.pathname + url.search + mobileSuffix,
-    { method: 'GET' }
-  );
+  const mobileSuffix = mobile && type === 'html' ? '&__m=1' : '';
+  return upURL + (upURL.includes('?') ? '&' : '?') + '__mirror=1' + mobileSuffix + variant;
+}
+
+function makeCacheKey(type, url, mobile, req) {
+  const key = new URL('https://x.cache/' + type + url.pathname + url.search);
+  if (mobile && type === 'html') key.searchParams.set('__m', '1');
+  if (type === 'html' || type === 'api')
+    key.searchParams.set('__lang', languageVariant(req));
+  return new Request(key.toString(), { method: 'GET' });
+}
+
+function isAllowedProxyHost(host) {
+  return PROXY_HOSTS.includes((host || '').toLowerCase());
 }
 
 function mkURL(proto, host, path, search) {

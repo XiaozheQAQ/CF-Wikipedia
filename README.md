@@ -12,7 +12,7 @@
 - 折叠区图片：MutationObserver 动态拦截，展开后图片正常加载
 - 双层缓存：Cloudflare 边缘缓存 + Worker Cache API，静态资源 7 天缓存
 - 防封禁：桌面 UA 池轮换，伪装请求头，隐藏 cf-ray 等标识
-- 媒体代理：`/proxy-media/` 前缀透传 upload.wikimedia.org 等资源域名
+- 媒体代理：`/proxy-media/` 前缀仅代理白名单中的 Wikimedia 资源域名
 
 ## 部署
 
@@ -94,6 +94,7 @@ const BLOCKED_IPS = [];
 - 只读镜像，编辑、登录、监视列表等写操作均返回 403
 - 用户讨论页、个人页面等依赖登录态的内容显示不全
 - 部分依赖第三方 CDN 的扩展功能（如地图）可能无法使用
+- 带 Cookie 或 Authorization 的请求不会进入公共 Worker 缓存，以避免用户状态串缓存
 - Cloudflare Workers 免费计划每天 10 万次请求，超出会 429；高流量建议升级 $5/月的 Paid 计划
 
 ---
